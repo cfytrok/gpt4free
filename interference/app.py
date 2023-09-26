@@ -7,6 +7,8 @@ import requests
 from flask import Flask, request
 from flask_cors import CORS
 from transformers import AutoTokenizer
+
+import g4f
 from g4f import ChatCompletion
 
 app = Flask(__name__)
@@ -19,7 +21,7 @@ def chat_completions():
     stream = request.get_json().get("stream", False)
     messages = request.get_json().get("messages")
 
-    response = ChatCompletion.create(model=model, stream=stream, messages=messages)
+    response = ChatCompletion.create(model=model, stream=stream, messages=messages, provider=g4f.Provider.DeepAi)
 
     completion_id = "".join(random.choices(string.ascii_letters + string.digits, k=28))
     completion_timestamp = int(time.time())
@@ -88,7 +90,37 @@ def chat_completions():
     return app.response_class(streaming(), mimetype="text/event-stream")
 
 
-#Get the embedding from huggingface
+@app.route("/models/<model>", methods=["GET"])
+def get_model(model: str):
+    return {
+        "id": model,
+        "object": "model",
+        "created": 1686935002,
+        "owned_by": "openai"
+    }
+
+@app.route("/models", methods=["GET"])
+def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gpt-4",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "organization-owner"
+            },
+            {
+                "id": "gpt-3.5-turbo",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "organization-owner",
+            },
+        ],
+    }
+
+
+# Get the embedding from huggingface
 def get_embedding(input_text, token):
     huggingface_token = token
     embedding_model = "sentence-transformers/all-mpnet-base-v2"
@@ -112,18 +144,19 @@ def get_embedding(input_text, token):
         api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{embedding_model}"
         headers = {"Authorization": f"Bearer {huggingface_token}"}
         chunk_text = chunk_text.replace("\n", " ")
-    
+
         # Make a POST request to get the chunk's embedding
-        response = requests.post(api_url, headers=headers, json={"inputs": chunk_text, "options": {"wait_for_model": True}})
-    
+        response = requests.post(api_url, headers=headers,
+                                 json={"inputs": chunk_text, "options": {"wait_for_model": True}})
+
         # Parse the response and extract the embedding
         chunk_embedding = response.json()
         # Append the embedding to the list
         embeddings.append(chunk_embedding)
 
-    #averaging all the embeddings
-    #this isn't very effective
-    #someone a better idea?
+    # averaging all the embeddings
+    # this isn't very effective
+    # someone a better idea?
     num_embeddings = len(embeddings)
     average_embedding = [sum(x) / num_embeddings for x in zip(*embeddings)]
     embedding = average_embedding
@@ -137,20 +170,21 @@ def embeddings():
     token = request.headers.get('Authorization').replace("Bearer ", "")
     embedding = get_embedding(input_text, token)
     return {
-  "data": [
-    {
-     "embedding": embedding,
-     "index": 0,
-     "object": "embedding"
-   }
-  ],
- "model": "text-embedding-ada-002",
-  "object": "list",
-  "usage": {
-    "prompt_tokens": None,
-    "total_tokens": None
-  }
-  }
+        "data": [
+            {
+                "embedding": embedding,
+                "index": 0,
+                "object": "embedding"
+            }
+        ],
+        "model": "text-embedding-ada-002",
+        "object": "list",
+        "usage": {
+            "prompt_tokens": None,
+            "total_tokens": None
+        }
+    }
+
 
 def main():
     app.run(host="0.0.0.0", port=1337, debug=True)
