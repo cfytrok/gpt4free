@@ -3,10 +3,15 @@ from __future__ import annotations
 import random
 import json
 import os
+import urllib.parse
 from aiohttp        import ClientSession, ClientTimeout
 from ..typing       import AsyncGenerator
-from .base_provider import AsyncGeneratorProvider, get_cookies
+from .base_provider import AsyncGeneratorProvider
 
+class Tones():
+    creative = "Creative"
+    balanced = "Balanced"
+    precise = "Precise"
 
 class Bing(AsyncGeneratorProvider):
     url             = "https://bing.com/chat"
@@ -15,12 +20,13 @@ class Bing(AsyncGeneratorProvider):
         
     @staticmethod
     def create_async_generator(
-            model: str,
-            messages: list[dict[str, str]],
-            cookies: dict = None, **kwargs) -> AsyncGenerator:
+        model: str,
+        messages: list[dict[str, str]],
+        cookies: dict = None,
+        tone: str = Tones.creative,
+        **kwargs
+    ) -> AsyncGenerator:
         
-        if not cookies:
-            cookies = get_cookies(".bing.com")
         if len(messages) < 2:
             prompt = messages[0]["content"]
             context = None
@@ -37,7 +43,7 @@ class Bing(AsyncGeneratorProvider):
                 'SRCHUSR'       : '',
                 'SRCHHPGUSR'    : '',
             }
-        return stream_generate(prompt, context, cookies)
+        return stream_generate(prompt, tone, context, cookies)
 
 def create_context(messages: list[dict[str, str]]):
     context = "".join(f"[{message['role']}](#message)\n{message['content']}\n\n" for message in messages)
@@ -62,6 +68,14 @@ async def create_conversation(session: ClientSession) -> Conversation:
             raise Exception('Failed to create conversation.')
         
         return Conversation(conversationId, clientId, conversationSignature)
+
+async def retry_conversation(session: ClientSession) -> Conversation:
+    for _ in range(5):
+        try:
+            return await create_conversation(session)
+        except:
+            session.cookie_jar.clear()
+    return await create_conversation(session)
 
 async def list_conversations(session: ClientSession) -> list:
     url = "https://www.bing.com/turing/conversation/chats"
@@ -161,34 +175,32 @@ class Defaults:
         'x-forwarded-for': ip_address,
     }
 
-    optionsSets = {
-        "optionsSets": [
-            'saharasugg',
-            'enablenewsfc',
-            'clgalileo',
-            'gencontentv3',
-            "nlu_direct_response_filter",
-            "deepleo",
-            "disable_emoji_spoken_text",
-            "responsible_ai_policy_235",
-            "enablemm",
-            "h3precise"
-            "dtappid",
-            "cricinfo",
-            "cricinfov2",
-            "dv3sugg",
-            "nojbfedge"
-        ]
-    }
+    optionsSets = [
+        'saharasugg',
+        'enablenewsfc',
+        'clgalileo',
+        'gencontentv3',
+        "nlu_direct_response_filter",
+        "deepleo",
+        "disable_emoji_spoken_text",
+        "responsible_ai_policy_235",
+        "enablemm",
+        "h3precise"
+        "dtappid",
+        "cricinfo",
+        "cricinfov2",
+        "dv3sugg",
+        "nojbfedge"
+    ]
 
 def format_message(msg: dict) -> str:
     return json.dumps(msg, ensure_ascii=False) + Defaults.delimiter
 
-def create_message(conversation: Conversation, prompt: str, context: str=None) -> str:
+def create_message(conversation: Conversation, prompt: str, tone: str, context: str=None) -> str:
     struct = {
         'arguments': [
             {
-                **Defaults.optionsSets,
+                'optionsSets': Defaults.optionsSets,
                 'source': 'cib',
                 'allowedMessageTypes': Defaults.allowedMessageTypes,
                 'sliceIds': Defaults.sliceIds,
@@ -200,6 +212,7 @@ def create_message(conversation: Conversation, prompt: str, context: str=None) -
                     'text': prompt,
                     'messageType': 'Chat'
                 },
+                'tone': tone,
                 'conversationSignature': conversation.conversationSignature,
                 'participant': {
                     'id': conversation.clientId
@@ -224,15 +237,16 @@ def create_message(conversation: Conversation, prompt: str, context: str=None) -
 
 async def stream_generate(
         prompt: str,
+        tone: str,
         context: str=None,
-        cookies: dict=None
+        cookies: dict=None,
     ):
     async with ClientSession(
         timeout=ClientTimeout(total=900),
         cookies=cookies,
         headers=Defaults.headers,
     ) as session:
-        conversation = await create_conversation(session)
+        conversation = await retry_conversation(session)
         try:
             async with session.ws_connect(
                 'wss://sydney.bing.com/sydney/ChatHub',
@@ -242,10 +256,9 @@ async def stream_generate(
                 await wss.send_str(format_message({'protocol': 'json', 'version': 1}))
                 msg = await wss.receive(timeout=900)
 
-                await wss.send_str(create_message(conversation, prompt, context))
+                await wss.send_str(create_message(conversation, prompt, tone, context))
 
                 response_txt = ''
-                result_text = ''
                 returned_text = ''
                 final = False
 
@@ -260,14 +273,18 @@ async def stream_generate(
                         if response.get('type') == 1 and response['arguments'][0].get('messages'):
                             message = response['arguments'][0]['messages'][0]
                             if (message['contentOrigin'] != 'Apology'):
-                                response_txt = result_text + \
-                                    message['adaptiveCards'][0]['body'][0].get('text', '')
-                                
-                                if message.get('messageType'):
-                                    inline_txt = message['adaptiveCards'][0]['body'][0]['inlines'][0].get('text')
-                                    response_txt += inline_txt + '\n'
-                                    result_text += inline_txt + '\n'
-
+                                if 'adaptiveCards' in message:
+                                    card = message['adaptiveCards'][0]['body'][0]
+                                    if "text" in card:
+                                        response_txt = card.get('text')
+                                    if message.get('messageType'):
+                                        inline_txt = card['inlines'][0].get('text')
+                                        response_txt += inline_txt + '\n'
+                                elif message.get('contentType') == "IMAGE":
+                                    query = urllib.parse.quote(message.get('text'))
+                                    url = f"\nhttps://www.bing.com/images/create?q={query}"
+                                    response_txt += url
+                                    final = True
                             if response_txt.startswith(returned_text):
                                 new = response_txt[len(returned_text):]
                                 if new != "\n":
@@ -277,7 +294,6 @@ async def stream_generate(
                             result = response['item']['result']
                             if result.get('error'):
                                 raise Exception(f"{result['value']}: {result['message']}")
-                            final = True
-                            break
+                            return
         finally:
             await delete_conversation(session, conversation)
