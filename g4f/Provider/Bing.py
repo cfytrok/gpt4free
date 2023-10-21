@@ -3,15 +3,25 @@ from __future__ import annotations
 import random
 import json
 import os
+import uuid
 import urllib.parse
 from aiohttp        import ClientSession, ClientTimeout
-from ..typing       import AsyncGenerator
+from ..typing       import AsyncResult, Messages
 from .base_provider import AsyncGeneratorProvider
 
 class Tones():
     creative = "Creative"
     balanced = "Balanced"
     precise = "Precise"
+
+default_cookies = {
+    'SRCHD'         : 'AF=NOFORM',
+    'PPLState'      : '1',
+    'KievRPSSecAuth': '',
+    'SUID'          : '',
+    'SRCHUSR'       : '',
+    'SRCHHPGUSR'    : '',
+}
 
 class Bing(AsyncGeneratorProvider):
     url             = "https://bing.com/chat"
@@ -21,12 +31,12 @@ class Bing(AsyncGeneratorProvider):
     @staticmethod
     def create_async_generator(
         model: str,
-        messages: list[dict[str, str]],
+        messages: Messages,
+        proxy: str = None,
         cookies: dict = None,
         tone: str = Tones.creative,
         **kwargs
-    ) -> AsyncGenerator:
-        
+    ) -> AsyncResult:
         if len(messages) < 2:
             prompt = messages[0]["content"]
             context = None
@@ -35,17 +45,10 @@ class Bing(AsyncGeneratorProvider):
             context = create_context(messages[:-1])
         
         if not cookies or "SRCHD" not in cookies:
-            cookies = {
-                'SRCHD'         : 'AF=NOFORM',
-                'PPLState'      : '1',
-                'KievRPSSecAuth': '',
-                'SUID'          : '',
-                'SRCHUSR'       : '',
-                'SRCHHPGUSR'    : '',
-            }
-        return stream_generate(prompt, tone, context, cookies)
+            cookies = default_cookies
+        return stream_generate(prompt, tone, context, proxy, cookies)
 
-def create_context(messages: list[dict[str, str]]):
+def create_context(messages: Messages):
     context = "".join(f"[{message['role']}](#message)\n{message['content']}\n\n" for message in messages)
 
     return context
@@ -56,26 +59,20 @@ class Conversation():
         self.clientId = clientId
         self.conversationSignature = conversationSignature
 
-async def create_conversation(session: ClientSession) -> Conversation:
-    url = 'https://www.bing.com/turing/conversation/create'
-    async with await session.get(url) as response:
-        response = await response.json()
-        conversationId = response.get('conversationId')
-        clientId = response.get('clientId')
-        conversationSignature = response.get('conversationSignature')
+async def create_conversation(session: ClientSession, proxy: str = None) -> Conversation:
+    url = 'https://www.bing.com/turing/conversation/create?bundleVersion=1.1150.3'
+    
+    async with await session.get(url, proxy=proxy) as response:
+        data = await response.json()
+        
+        conversationId = data.get('conversationId')
+        clientId = data.get('clientId')
+        conversationSignature = response.headers.get('X-Sydney-Encryptedconversationsignature')
 
         if not conversationId or not clientId or not conversationSignature:
             raise Exception('Failed to create conversation.')
         
         return Conversation(conversationId, clientId, conversationSignature)
-
-async def retry_conversation(session: ClientSession) -> Conversation:
-    for _ in range(5):
-        try:
-            return await create_conversation(session)
-        except:
-            session.cookie_jar.clear()
-    return await create_conversation(session)
 
 async def list_conversations(session: ClientSession) -> list:
     url = "https://www.bing.com/turing/conversation/chats"
@@ -83,7 +80,7 @@ async def list_conversations(session: ClientSession) -> list:
         response = await response.json()
         return response["chats"]
         
-async def delete_conversation(session: ClientSession, conversation: Conversation) -> list:
+async def delete_conversation(session: ClientSession, conversation: Conversation, proxy: str = None) -> list:
     url = "https://sydney.bing.com/sydney/DeleteSingleConversation"
     json = {
         "conversationId": conversation.conversationId,
@@ -92,7 +89,7 @@ async def delete_conversation(session: ClientSession, conversation: Conversation
         "source": "cib",
         "optionsSets": ["autosave"]
     }
-    async with session.post(url, json=json) as response:
+    async with session.post(url, json=json, proxy=proxy) as response:
         response = await response.json()
         return response["result"]["value"] == "Success"
 
@@ -197,30 +194,34 @@ def format_message(msg: dict) -> str:
     return json.dumps(msg, ensure_ascii=False) + Defaults.delimiter
 
 def create_message(conversation: Conversation, prompt: str, tone: str, context: str=None) -> str:
+    request_id = str(uuid.uuid4())
     struct = {
         'arguments': [
             {
-                'optionsSets': Defaults.optionsSets,
                 'source': 'cib',
+                'optionsSets': Defaults.optionsSets,
                 'allowedMessageTypes': Defaults.allowedMessageTypes,
                 'sliceIds': Defaults.sliceIds,
                 'traceId': os.urandom(16).hex(),
                 'isStartOfSession': True,
+                'requestId': request_id,
                 'message': Defaults.location | {
                     'author': 'user',
                     'inputMethod': 'Keyboard',
                     'text': prompt,
-                    'messageType': 'Chat'
+                    'messageType': 'Chat',
+                    'requestId': request_id,
+                    'messageId': request_id,
                 },
                 'tone': tone,
-                'conversationSignature': conversation.conversationSignature,
+                'spokenTextMode': 'None',
+                'conversationId': conversation.conversationId,
                 'participant': {
                     'id': conversation.clientId
                 },
-                'conversationId': conversation.conversationId
             }
         ],
-        'invocationId': '0',
+        'invocationId': '1',
         'target': 'chat',
         'type': 4
     }
@@ -238,24 +239,26 @@ def create_message(conversation: Conversation, prompt: str, tone: str, context: 
 async def stream_generate(
         prompt: str,
         tone: str,
-        context: str=None,
-        cookies: dict=None,
+        context: str = None,
+        proxy: str = None,
+        cookies: dict = None
     ):
     async with ClientSession(
         timeout=ClientTimeout(total=900),
         cookies=cookies,
         headers=Defaults.headers,
     ) as session:
-        conversation = await retry_conversation(session)
+        conversation = await create_conversation(session, proxy)
         try:
             async with session.ws_connect(
-                'wss://sydney.bing.com/sydney/ChatHub',
+                f'wss://sydney.bing.com/sydney/ChatHub',
                 autoping=False,
+                params={'sec_access_token': conversation.conversationSignature},
+                proxy=proxy
             ) as wss:
                 
                 await wss.send_str(format_message({'protocol': 'json', 'version': 1}))
-                msg = await wss.receive(timeout=900)
-
+                await wss.receive(timeout=900)
                 await wss.send_str(create_message(conversation, prompt, tone, context))
 
                 response_txt = ''
@@ -268,7 +271,7 @@ async def stream_generate(
                     for obj in objects:
                         if obj is None or not obj:
                             continue
-
+                        
                         response = json.loads(obj)
                         if response.get('type') == 1 and response['arguments'][0].get('messages'):
                             message = response['arguments'][0]['messages'][0]
@@ -296,4 +299,4 @@ async def stream_generate(
                                 raise Exception(f"{result['value']}: {result['message']}")
                             return
         finally:
-            await delete_conversation(session, conversation)
+            await delete_conversation(session, conversation, proxy)
